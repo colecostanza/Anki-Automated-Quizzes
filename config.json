@@ -1,0 +1,11 @@
+{
+  "default_deck": "",
+  "num_choices": 4,
+  "num_questions": 25,
+  "exclude_tags": [],
+  "allow_answer_reuse": true,
+  "last_model_name": "",
+  "last_prompt_field": "FrontText",
+  "last_answer_field": "BackText",
+  "num_per_page": 5
+}

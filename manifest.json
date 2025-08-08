@@ -1,0 +1,10 @@
+{
+  "package": "anki-automated-quizzes",
+  "name": "Automated Quizzes",
+  "mod": 1754605673,
+  "version": "0.0.3",
+  "author": "ColeCostanza",
+  "description": "Automates quiz creation in Anki.",
+  "homepage": "",
+  "conflicts": []
+}
