@@ -28,6 +28,8 @@ Great to pair with [@sviatoslav-lebediev's](https://github.com/sviatoslav-lebedi
 
 ## Installation
 
-To install download the [Anki Automated Quizzes.ankiaddon](https://github.com/colecostanza/Anki-Automated-Quizzes/blob/main/Anki%20Automated%20Quizzes.ankiaddon) file and either double-click the add-on or import via Tools > Add-ons > Install from file...
+To install via add-on code open Tools > Add-ons > Get Add-ons > Enter code "1877347202" > OK
 
-You may also package this add-on yourself by cloning the repository, compressing the contents to a zip, and renaming from ".zip" to ".ankiaddon". A this time I do not have an add-on code.
+To install from a file download the [Anki Automated Quizzes.ankiaddon](https://github.com/colecostanza/Anki-Automated-Quizzes/blob/main/Anki%20Automated%20Quizzes.ankiaddon) file and either double-click the add-on or import via Tools > Add-ons > Install from file...
+
+You may also package this add-on yourself by cloning the repository, compressing the contents to a zip, and renaming from ".zip" to ".ankiaddon".

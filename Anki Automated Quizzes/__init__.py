@@ -1,12 +1,27 @@
 from aqt import mw
-from aqt.qt import QAction, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox, QSpinBox, QListWidget, QListWidgetItem, QMessageBox, QCheckBox, QWidget
+from aqt.qt import (
+    QAction,
+    QDialog,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QComboBox,
+    QSpinBox,
+    QListWidget,
+    QListWidgetItem,
+    QWidget,
+    QCheckBox,
+    QMessageBox,
+)
 from aqt.utils import tooltip
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QFileDialog
+from PyQt6.QtWidgets import QFileDialog, QSizePolicy, QRadioButton, QFrame, QScrollArea
 import random
-from collections import defaultdict
 import os
 import json
+import re
+from functools import partial
 
 # ---- Cross-version helpers ----
 def _deck_tuple(dni):
@@ -73,24 +88,34 @@ def _collect_models_and_fields(nids):
         res[mname] = (mobj, fields)
     return res
 
+def _strip_html(text: str) -> str:
+    text = re.sub(r"<br\s*/?>", "\n", text or "", flags=re.IGNORECASE)
+    text = re.sub(r"</?[^>]+>", "", text or "")
+    return text.strip()
+
+def _normalize_html(s: str) -> str:
+    """Normalize for equality checks: collapse whitespace, lower, strip."""
+    s = (s or "").replace("\r", "").replace("\n", "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
 def _notes_to_qa(notes, prompt_field, answer_field, required_model_name=None):
     qa = []
     for nid in notes:
         n = mw.col.get_note(nid)
         if n is None:
             continue
-        if required_model_name:
-            if _note_type_name(n) != required_model_name:
-                continue
+        if required_model_name and _note_type_name(n) != required_model_name:
+            continue
         if prompt_field not in n or answer_field not in n:
             continue
-        front = n[prompt_field].strip()
-        back = n[answer_field].strip()
+        front = (n[prompt_field] or "").strip()
+        back = (n[answer_field] or "").strip()
         if front and back:
             qa.append({"nid": nid, "prompt": front, "answer": back})
     return qa
 
-def _make_quiz_items(qa, num_questions, num_choices, allow_answer_resuse):
+def _make_quiz_items(qa, num_questions, num_choices, allow_answer_reuse: bool):
     if len(qa) == 0:
         raise ValueError("No notes found to generate questions.")
     pool = qa[:]
@@ -103,24 +128,25 @@ def _make_quiz_items(qa, num_questions, num_choices, allow_answer_resuse):
         correct = item["answer"]
         options = [correct]
 
-        if allow_answer_resuse:
-            unique_others = [a for a in set(all_answers) if a != correct]
+        if allow_answer_reuse:
+            unique_others = [a for a in set(all_answers) if _normalize_html(a) != _normalize_html(correct)]
             random.shuffle(unique_others)
             options += unique_others[:max(0, num_choices - 1)]
             while len(options) < num_choices:
                 options.append(random.choice(all_answers))
         else:
-            candidates = [a for a in set(all_answers) if a != correct]
+            candidates = [a for a in set(all_answers) if _normalize_html(a) != _normalize_html(correct)]
             random.shuffle(candidates)
             options += candidates[:max(0, num_choices - 1)]
+
         options = options[:num_choices]
         random.shuffle(options)
 
         quiz.append({
             "nid": item["nid"],
-            "prompt": item["prompt"],
-            "correct": correct,
-            "options": options
+            "prompt": item["prompt"],     # raw HTML allowed
+            "correct": correct,           # raw HTML allowed
+            "options": options,           # list of raw HTML strings
         })
     return quiz
 
@@ -142,11 +168,41 @@ def _save_history(nid_list):
     with open(_history_path(), "w", encoding="utf-8") as f:
         json.dump(list(history), f)
 
+# ---- Option row widget (Radio + HTML label) ----
+class OptionRow(QWidget):
+    def __init__(self, html_text: str, parent=None):
+        super().__init__(parent)
+        self.raw_html = html_text or ""
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 4, 0, 4)
+        self.radio = QRadioButton(self)
+        row.addWidget(self.radio, 0)
+        self.label = QLabel(self)
+        self.label.setTextFormat(Qt.TextFormat.RichText)
+        self.label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.label.setOpenExternalLinks(True)
+        self.label.setWordWrap(True)
+        # Render raw HTML; if actually empty, show a placeholder
+        self.label.setText(self.raw_html if self.raw_html.strip() else "<i>(blank)</i>")
+        self.label.setMinimumWidth(400)
+        self.label.setMaximumWidth(700)
+        row.addWidget(self.label, 1)
+
+        # Allow clicking the label to toggle the radio
+        self.label.mousePressEvent = lambda e: self.radio.setChecked(True)
+
+    def set_enabled(self, enabled: bool):
+        self.radio.setEnabled(enabled)
+        self.label.setEnabled(enabled)
+
+    def set_background(self, color_css: str):
+        self.setStyleSheet(f"QWidget {{ background: {color_css}; border-radius: 6px; }}")
+
 class MCQuizDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Automated Quiz")
-        self.resize(800, 600)
+        self.resize(900, 700)
 
         self.cfg = mw.addonManager.getConfig(__name__) or {}
         self.cfg.setdefault("default_deck", "")
@@ -161,11 +217,10 @@ class MCQuizDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
-        # --- Group config widgets ---
+        # --- Config panel ---
         self.config_widget = QWidget(self)
         config_layout = QVBoxLayout(self.config_widget)
 
-        # Deck selector
         decks = _get_all_decks()
         self.deck_cb = QComboBox(self.config_widget)
         names = [name for (_id, name) in decks]
@@ -176,7 +231,6 @@ class MCQuizDialog(QDialog):
         config_layout.addWidget(QLabel("Deck:"))
         config_layout.addWidget(self.deck_cb)
 
-        # Model + field pickers
         config_layout.addWidget(QLabel("Note type:"))
         self.model_cb = QComboBox(self.config_widget)
         config_layout.addWidget(self.model_cb)
@@ -190,7 +244,6 @@ class MCQuizDialog(QDialog):
         pf_row.addWidget(self.answer_cb)
         config_layout.addLayout(pf_row)
 
-        # Questions / choices
         row = QHBoxLayout()
         row.addWidget(QLabel("Questions:"))
         self.qcount = QSpinBox(self.config_widget); self.qcount.setRange(1, 1000); self.qcount.setValue(int(self.cfg["num_questions"]))
@@ -198,72 +251,69 @@ class MCQuizDialog(QDialog):
         row.addWidget(QLabel("Choices:"))
         self.ccount = QSpinBox(self.config_widget); self.ccount.setRange(2, 10); self.ccount.setValue(int(self.cfg["num_choices"]))
         row.addWidget(self.ccount)
-        # Add Questions per page
         row.addWidget(QLabel("Questions per page:"))
         self.qperpage = QSpinBox(self.config_widget); self.qperpage.setRange(1, 20); self.qperpage.setValue(int(self.cfg.get("num_per_page", 5)))
         row.addWidget(self.qperpage)
         config_layout.addLayout(row)
 
-        # Toggles
         self.dup_cb = QCheckBox("Allow answer reuse", self.config_widget)
         self.dup_cb.setChecked(bool(self.cfg["allow_answer_reuse"]))
         config_layout.addWidget(self.dup_cb)
 
-        # Excluded tags (simple list display)
         config_layout.addWidget(QLabel("Exclude tags (optional):"))
         self.tags_list = QListWidget(self.config_widget)
         for t in self.cfg["exclude_tags"]:
             self.tags_list.addItem(QListWidgetItem(t))
         config_layout.addWidget(self.tags_list)
 
-        # Exclude history checkbox
         self.exclude_history_cb = QCheckBox("Exclude cards from previous quizzes", self.config_widget)
         self.exclude_history_cb.setChecked(False)
         config_layout.addWidget(self.exclude_history_cb)
 
-        # Clear quiz history button
         self.clear_history_btn = QPushButton("Clear Quiz History", self.config_widget)
         self.clear_history_btn.clicked.connect(self._on_clear_history)
         config_layout.addWidget(self.clear_history_btn)
 
-        # Start button
         self.start_btn = QPushButton("Start Quiz", self.config_widget)
         self.start_btn.clicked.connect(self.start_quiz)
         config_layout.addWidget(self.start_btn)
 
-        # Add config_widget to main layout
         layout.addWidget(self.config_widget)
 
-        # Quiz UI container
-        self.quiz_container = QVBoxLayout()
-        layout.addLayout(self.quiz_container)
+        # --- Quiz container inside a scroll area ---
+        self.quiz_widget = QWidget()
+        self.quiz_container = QVBoxLayout(self.quiz_widget)
+        self.quiz_widget.setLayout(self.quiz_container)
 
-        # Next Page button
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setWidget(self.quiz_widget)
+        layout.addWidget(self.scroll_area)
+
+        # Nav buttons
         self.next_btn = QPushButton("Next Page")
         self.next_btn.clicked.connect(self._on_next_page)
         self.next_btn.hide()
         layout.addWidget(self.next_btn)
 
-        # Previous Page button
         self.prev_btn = QPushButton("Previous Page")
         self.prev_btn.clicked.connect(self._on_prev_page)
         self.prev_btn.hide()
         layout.addWidget(self.prev_btn)
 
-        # Events
+        # Signals
         self.deck_cb.currentTextChanged.connect(self._on_deck_changed)
         self.model_cb.currentTextChanged.connect(self._on_model_changed)
 
-        # Initialize model/field pickers
+        # Init
         self._on_deck_changed(self.deck_cb.currentText())
 
         self.state = {"quiz": [], "idx": 0, "correct": 0, "total": 0, "page": 0, "per_page": 1}
         self.current_question_widgets = []
-        self.user_answers = {}  # key: quiz index, value: chosen answer
+        self.user_answers = {}  # quiz index -> chosen raw html
 
-    # ---- UI update helpers ----
+    # ---- UI updates ----
     def _on_deck_changed(self, deck_name):
-        # collect models present in deck
         nids = _find_notes_in_deck(deck_name, [])
         models = _collect_models_and_fields(nids)
         self.model_cb.blockSignals(True)
@@ -272,11 +322,9 @@ class MCQuizDialog(QDialog):
             self.model_cb.addItem(mname)
         self.model_cb.blockSignals(False)
 
-        # remember
         if self.cfg.get("last_model_name") in models:
             self.model_cb.setCurrentText(self.cfg["last_model_name"])
 
-        # populate fields for selected
         self._populate_fields(deck_models=models)
 
     def _populate_fields(self, deck_models=None):
@@ -298,11 +346,9 @@ class MCQuizDialog(QDialog):
             self.prompt_cb.addItem(f)
             self.answer_cb.addItem(f)
 
-        # restore last choices if valid
         if self.cfg.get("last_prompt_field") in fields:
             self.prompt_cb.setCurrentText(self.cfg["last_prompt_field"])
         else:
-            # heuristic defaults
             for guess in ("Front", "Question", "Prompt"):
                 if guess in fields:
                     self.prompt_cb.setCurrentText(guess); break
@@ -355,7 +401,7 @@ class MCQuizDialog(QDialog):
         self.cfg["default_deck"] = deck
         self.cfg["num_choices"] = num_c
         self.cfg["num_questions"] = num_q
-        self.cfg["allow_duplicate_distractors"] = allow_dup
+        self.cfg["allow_answer_reuse"] = allow_dup
         self.cfg["last_model_name"] = model_name
         self.cfg["last_prompt_field"] = prompt_field
         self.cfg["last_answer_field"] = answer_field
@@ -372,14 +418,13 @@ class MCQuizDialog(QDialog):
             "correct": 0,
             "total": len(quiz),
             "page": 0,
-            "per_page": int(self.qperpage.value())
+            "per_page": int(self.qperpage.value()),
         }
         self.user_answers = {}
-        self.config_widget.hide()  # <--- Hide config when quiz starts
+        self.config_widget.hide()
         self._show_current_page()
 
     def _clear_quiz_container(self):
-        # Remove all widgets from the quiz container
         for widget in self.current_question_widgets:
             widget.setParent(None)
         self.current_question_widgets = []
@@ -398,32 +443,32 @@ class MCQuizDialog(QDialog):
             return
 
         end = min(idx + per_page, total)
-        self.page_answers = [None] * (end - idx)
-        self.page_btns = []
+        self.page_option_rows = []
 
         for i, qidx in enumerate(range(idx, end)):
             q = quiz[qidx]
             q_group = QVBoxLayout()
-            q_label = QLabel(f"Q{qidx+1}: {q['prompt']}")
+            q_label = QLabel(f"Q{qidx+1}: {_strip_html(q['prompt'])}")
+            q_label.setWordWrap(True)
+            q_label.setMaximumWidth(820)
             q_group.addWidget(q_label)
-            btn_group = QHBoxLayout()
-            btns = []
+
+            rows = []
             for opt in q["options"]:
-                btn = QPushButton(opt)
-                btn.setCheckable(True)
-                btn.clicked.connect(lambda checked, i=i, opt=opt, btn=btn: self._on_choose(i, opt, btn))
-                btn_group.addWidget(btn)
-                btns.append(btn)
-                self.current_question_widgets.append(btn)
-            q_group.addLayout(btn_group)
+                row = OptionRow(opt, self)
+                # clicking the radio selects and finalizes the question
+                row.radio.toggled.connect(partial(self._on_choose, i, row))
+                q_group.addWidget(row)
+                rows.append(row)
+                self.current_question_widgets.append(row)
+            self.page_option_rows.append(rows)
+
             group_widget = QWidget()
             group_widget.setLayout(q_group)
             self.quiz_container.addWidget(group_widget)
             self.current_question_widgets.append(q_label)
             self.current_question_widgets.append(group_widget)
-            self.page_btns.append(btns)
 
-        # Show/hide next/prev buttons
         if end < total:
             self.next_btn.setText("Next Page")
             self.next_btn.show()
@@ -436,35 +481,43 @@ class MCQuizDialog(QDialog):
         else:
             self.prev_btn.hide()
 
-    def _on_choose(self, question_idx, chosen, btn):
+        # --- Auto-scroll to top ---
+        self.scroll_area.verticalScrollBar().setValue(0)
+
+    def _on_choose(self, question_idx_in_page, chosen_row: OptionRow, checked: bool):
+        if not checked:
+            return
         quiz = self.state["quiz"]
         idx = self.state["idx"]
-        qidx = idx + question_idx
-        q = quiz[qidx]
-        btns = self.page_btns[question_idx]
-
+        qidx = idx + question_idx_in_page
         if qidx in self.user_answers:
-            return  # Already answered, ignore further clicks
+            return  # already answered
 
-        self.user_answers[qidx] = chosen
+        q = quiz[qidx]
+        chosen_raw = chosen_row.raw_html
+        correct_raw = q["correct"]
 
-        if chosen == q["correct"]:
+        # record
+        self.user_answers[qidx] = chosen_raw
+
+        # peer rows for this question
+        rows = self.page_option_rows[question_idx_in_page]
+        # lock and colorize
+        for row in rows:
+            row.set_enabled(False)
+            if _normalize_html(row.raw_html) == _normalize_html(correct_raw):
+                row.set_background("#1f6f1f")  # green
+            elif row is chosen_row:
+                row.set_background("#7f1f1f")  # red
+
+        if _normalize_html(chosen_raw) == _normalize_html(correct_raw):
             self.state["correct"] += 1
-            btn.setStyleSheet("background-color: lightgreen;")
-            for b in btns:
-                b.setEnabled(False)
-        else:
-            btn.setStyleSheet("background-color: salmon;")
-            for b in btns:
-                b.setEnabled(False)
 
     def _on_next_page(self):
-        # Move to next set of questions
         self.state["idx"] += self.state["per_page"]
         self._show_current_page()
 
     def _on_prev_page(self):
-        # Move to previous set of questions
         self.state["idx"] = max(0, self.state["idx"] - self.state["per_page"])
         self._show_current_page()
 
@@ -479,13 +532,15 @@ class MCQuizDialog(QDialog):
         self.quiz_container.addWidget(summary)
         self.current_question_widgets.append(summary)
 
-        # Table of results
+        # results table (text-only for readability)
         html = "<table border=1 cellpadding=4><tr><th>#</th><th>Prompt</th><th>Your Answer</th><th>Correct Answer</th></tr>"
         for i, q in enumerate(quiz):
-            user_ans = self.user_answers.get(i, "")
-            correct_ans = q["correct"]
-            color = "#cfc" if user_ans == correct_ans else "#fcc"
-            html += f"<tr style='background:{color}'><td>{i+1}</td><td>{q['prompt']}</td><td>{user_ans}</td><td>{correct_ans}</td></tr>"
+            ua_raw = self.user_answers.get(i, "")
+            ua_txt = _strip_html(ua_raw)
+            ca_txt = _strip_html(q["correct"])
+            color = "#cfc" if _normalize_html(ua_raw) == _normalize_html(q["correct"]) else "#fcc"
+            prompt_txt = _strip_html(q["prompt"])
+            html += f"<tr style='background:{color}'><td>{i+1}</td><td>{prompt_txt}</td><td>{ua_txt}</td><td>{ca_txt}</td></tr>"
         html += "</table>"
 
         results_label = QLabel()
@@ -495,16 +550,12 @@ class MCQuizDialog(QDialog):
         self.quiz_container.addWidget(results_label)
         self.current_question_widgets.append(results_label)
 
-        # Export button
         export_btn = QPushButton("Export Results to HTML")
         export_btn.clicked.connect(self._export_results_html)
         self.quiz_container.addWidget(export_btn)
         self.current_question_widgets.append(export_btn)
 
-        # Save quiz history
         _save_history([q["nid"] for q in quiz])
-
-        # Show config again
         self.config_widget.show()
 
     def _export_results_html(self):
@@ -516,10 +567,12 @@ class MCQuizDialog(QDialog):
         html = f"<h2>Quiz Results</h2><p>Score: {correct}/{total} ({pct}%)</p>"
         html += "<table border=1 cellpadding=4><tr><th>#</th><th>Prompt</th><th>Your Answer</th><th>Correct Answer</th></tr>"
         for i, q in enumerate(quiz):
-            user_ans = self.user_answers.get(i, "")
-            correct_ans = q["correct"]
-            color = "#cfc" if user_ans == correct_ans else "#fcc"
-            html += f"<tr style='background:{color}'><td>{i+1}</td><td>{q['prompt']}</td><td>{user_ans}</td><td>{correct_ans}</td></tr>"
+            ua_raw = self.user_answers.get(i, "")
+            ua_txt = _strip_html(ua_raw)
+            ca_txt = _strip_html(q["correct"])
+            color = "#cfc" if _normalize_html(ua_raw) == _normalize_html(q["correct"]) else "#fcc"
+            prompt_txt = _strip_html(q["prompt"])
+            html += f"<tr style='background:{color}'><td>{i+1}</td><td>{prompt_txt}</td><td>{ua_txt}</td><td>{ca_txt}</td></tr>"
         html += "</table>"
 
         fname, _ = QFileDialog.getSaveFileName(self, "Save Results", "quiz_results.html", "HTML Files (*.html)")
@@ -528,18 +581,15 @@ class MCQuizDialog(QDialog):
                 f.write(html)
             tooltip("Results exported.")
 
-        # Retry button
         retry_btn = QPushButton("Retry Quiz")
         retry_btn.clicked.connect(self.retry_quiz)
         self.quiz_container.addWidget(retry_btn)
         self.current_question_widgets.append(retry_btn)
 
     def retry_quiz(self):
-        # Reset state and UI to allow retrying the quiz
         self.state = {"quiz": [], "idx": 0, "correct": 0, "total": 0, "page": 0, "per_page": 5}
         self.user_answers = {}
         self.config_widget.show()
-        self.quiz_container.addLayout(self.config_widget.layout())
         self.next_btn.hide()
         self.prev_btn.hide()
 
@@ -550,16 +600,12 @@ class MCQuizDialog(QDialog):
                 os.remove(path)
                 tooltip("Quiz history cleared.")
             except Exception as e:
-                QMessageBox.warning(self, "Error", f"Could not clear history:\n{e}")
-        else:
-            tooltip("Quiz history is already empty.")
+                tooltip(f"Error clearing quiz history: {e}")
 
-def on_action():
-    MCQuizDialog(mw).exec()
+def show_quiz_dialog():
+    dlg = MCQuizDialog(mw)
+    dlg.exec()
 
-def _add_menu_item():
-    action = QAction("Automated Quiz", mw)
-    action.triggered.connect(on_action)
-    mw.form.menuTools.addAction(action)
-
-_add_menu_item()
+action = QAction("Automated Quizzes", mw)
+action.triggered.connect(show_quiz_dialog)
+mw.form.menuTools.addAction(action)
